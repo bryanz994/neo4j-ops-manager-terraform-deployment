@@ -34,5 +34,4 @@ override.tf.json
 terraform.rc
 
 # Others
-assets/
 keys/
