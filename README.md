@@ -37,7 +37,7 @@ A working Terraform setup in your local machine or host which is going to be use
    4. IAMFullAccess
    5. AmazonElasticIPFullAccess
    6. AmazonSSMFullAccess
-4. Create an Access Key in AWS
+4. Create an Access Key in AWS, refer to this [guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html)
 5. Replace your Access Key and Secret Key in the `cred` file inside the `./keys` folder
 6. Replace the contents of your SSH public key in the `public-key` variable inside the `variables.tf` file 
 
