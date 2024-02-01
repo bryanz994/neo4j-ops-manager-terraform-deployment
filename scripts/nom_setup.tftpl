@@ -1,0 +1,90 @@
+#!/bin/bash
+db_home="/home/${db_owner}"
+nom_server_home="/usr/local/bin/nom-server"
+file="$db_home/conf/neo4j.conf"
+echo "Executing User_data"
+useradd -m ${db_owner} -s /bin/bash
+echo "${db_owner}     ALL=(ALL) NOPASSWD:ALL" | sudo EDITOR='tee -a' visudo
+mkdir -p $db_home/installation-staging 
+mkdir -p /usr/local/bin/nom-server/certificates/
+mkdir -p /usr/local/bin/nom-server/logs/
+yum install python3 python3-pip -y
+yum install java-17-openjdk -y
+pip3 install awscli
+aws s3 cp s3://terraform-neo4j-nom-s3/ $db_home/installation-staging --recursive
+
+cd $db_home/
+tar -xf $db_home/installation-staging/neo4j-enterprise-${neo4j_version}-unix.tar.gz
+tar -xf $db_home/installation-staging/neo4j-ops-manager-server-${nom_version}-unix.tar.gz
+
+mv $db_home/neo4j-enterprise-${neo4j_version}/* .
+mv $db_home/neo4j-ops-manager-server-${nom_version}/* $nom_server_home
+cp $db_home/installation-staging/server.pfx $db_home/certificates/
+cp $db_home/installation-staging/server.pfx $nom_server_home/certificates/
+
+chown -R ${db_owner}:${db_owner} $db_home/*
+
+$db_home/bin/neo4j-admin server license --accept-commercial
+$db_home/bin/neo4j-admin dbms set-initial-password neo4jneo4j
+$db_home/bin/neo4j start
+
+sleep 20
+sed -i 's/org\.springframework\.boot\.loader\.JarLauncher/org\.springframework\.boot\.loader\.launch\.JarLauncher/' $nom_server_home/bin/server 
+semanage fcontext -a -t bin_t $nom_server_home/bin/server
+restorecon -v $nom_server_home/bin/server
+
+# Wait for agents to upload their certificates
+sleep 30
+
+# Download certificates from S3
+aws s3 ls s3://terraform-neo4j-nom-s3/
+aws s3 cp s3://terraform-neo4j-nom-s3/ $nom_server_home/certificates --recursive --exclude "*" --include "nom-*.cert.pem"
+cat $nom_server_home/certificates/nom-*.cert.pem >> $nom_server_home/certificates/nom-agents.cert.pem
+chmod 644 $nom_server_home/certificates/nom-agents.cert.pem
+
+tee -a /etc/systemd/system/neo4j-ops-manager-server.service >/dev/null <<EOT
+[Unit]
+Description=Neo4j Ops Manager Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$nom_server_home/bin/server 
+Restart=on-failure
+TimeoutSec=120
+
+# Any of the command line parameters can be specified as an environment variable if needed.
+# Below is environment variable counterparts of the above command line parameters, update
+# and uncomment based on your requirements.
+Environment="SPRING_NEO4J_URI=neo4j://localhost:7687"
+Environment="SPRING_NEO4J_AUTHENTICATION_USERNAME=neo4j"
+Environment="SPRING_NEO4J_AUTHENTICATION_PASSWORD=neo4jneo4j"
+Environment="SERVER_PORT=8080"
+Environment="SERVER_SSL_KEY_STORE_TYPE=PKCS12"
+Environment="SERVER_SSL_KEY_STORE=file:$nom_server_home/certificates/server.pfx"
+Environment="SERVER_SSL_KEY_STORE_PASSWORD=changeit"
+Environment="GRPC_SERVER_PORT=9090"
+Environment="GRPC_SERVER_SECURITY_KEY_STORE_TYPE=PKCS12"
+Environment="GRPC_SERVER_SECURITY_KEY_STORE=file:$nom_server_home/certificates/server.pfx"
+Environment="GRPC_SERVER_SECURITY_KEY_STORE_PASSWORD=changeit"
+Environment="GRPC_SERVER_SECURITY_TRUST_CERT_COLLECTION=file:/usr/local/bin/nom-server/certificates/nom-agents.cert.pem"
+Environment="GRPC_SERVER_SECURITY_CLIENT_AUTH=OPTIONAL"
+
+# Logs will be captured by journal by default. You can also specify a dedicated log file
+# if desired. In that case uncomment and configure the full path to the log file you want to
+# use. Please ensure the server process has correct permissions for the log path specified.
+Environment="LOGGING_FILE_NAME=/usr/local/bin/nom-server/logs/nom.log"
+
+[Install]
+WantedBy=multi-user.target
+
+EOT
+
+
+systemctl daemon-reload
+systemctl enable neo4j-ops-manager-server
+systemctl start neo4j-ops-manager-server
+
+
+rm -rf installation-staging
+rm -rf neo4j-enterprise-${neo4j_version}

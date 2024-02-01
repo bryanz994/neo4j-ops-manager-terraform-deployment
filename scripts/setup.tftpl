@@ -1,0 +1,171 @@
+#!/bin/bash
+db_home="/home/${db_owner}"
+nom_agent_home="/usr/local/bin/nom"
+file="$db_home/conf/neo4j.conf"
+echo "Executing User_data"
+useradd -m ${db_owner} -s /bin/bash
+echo "${db_owner}     ALL=(ALL) NOPASSWD:ALL" | sudo EDITOR='tee -a' visudo
+mkdir -p $db_home/installation-staging 
+mkdir -p /usr/local/bin/nom/certificates/
+mkdir -p /usr/local/bin/nom/logs/
+yum install python3 python3-pip -y
+yum install java-17-openjdk -y
+pip3 install awscli
+aws s3 cp s3://terraform-neo4j-nom-s3/ $db_home/installation-staging --recursive
+
+cd $db_home/
+#sudo tar -xf installation-staging/database/neo4j-enterprise-${neo4j_version}-unix.tar.gz
+#sudo mv neo4j-enterprise-${neo4j_version}/* .
+tar -xf $db_home/installation-staging/neo4j-enterprise-${neo4j_version}-unix.tar.gz
+tar -xf $db_home/installation-staging/neo4j-ops-manager-agent-${nom_version}-linux-amd64.tar.gz
+mv $db_home/neo4j-enterprise-${neo4j_version}/* .
+mv $db_home/neo4j-ops-manager-agent-${nom_version}/* /usr/local/bin/nom/
+cp $db_home/installation-staging/server.pfx $db_home/certificates/
+cp $db_home/installation-staging/server.pfx $nom_agent_home/certificates/
+
+chown -R ${db_owner}:${db_owner} $db_home/*
+# Set config properties
+
+sleep 20
+export PUBLIC_IPV4=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# Open DB Listener
+cp conf/neo4j.conf conf/neo4j.conf.bak #backing up config just in-case :)
+sed -i '/server\.directories\.import\=import/d' conf/neo4j.conf
+
+tee -a conf/neo4j.conf >/dev/null <<EOT
+# Default listen address
+server.default_listen_address=0.0.0.0
+# Default advertised address
+server.default_advertised_address=${private_ip}
+server.bolt.advertised_address=$PUBLIC_IPV4
+server.http.advertised_address=$PUBLIC_IPV4
+
+# File imports
+#server.security.allow_csv_import_from_file_urls=true
+# Directory paths
+# server.directories.data=/mnt/neo4j/data
+# server.directories.import=/mnt/neo4j/import
+# Memory config
+server.memory.heap.initial_size=${initial_heap_size}g
+server.memory.heap.max_size=${max_heap_size}g
+server.memory.pagecache.size=${page_cache_size}g
+# DBMS Upgrade
+#dbms.allow_upgrade=${allow_upgrade}
+# Extensions Activation
+#dbms.security.procedures.unrestricted=apoc.*,bloom.*
+#dbms.security.procedures.allowlist=apoc.*,bloom.*
+#dbms.unmanaged_extension_classes=com.neo4j.bloom.server=/bloom
+#dbms.security.http_auth_allowlist=/,/browser.*,/bloom.*
+# APOC
+#apoc.import.file.enabled=true
+#apoc.export.file.enabled=true
+#apoc.import.file.use_neo4j_config=true
+# Bloom License
+#neo4j.bloom.license_file=$db_home/licenses/${bloom_license}
+# Causal Cluster Setup
+initial.server.mode_constraint=NONE
+# dbms.cluster.num_primaries=3
+# dbms.cluster.minimum_initial_members=4
+dbms.routing.default_router=SERVER
+dbms.cluster.discovery.endpoints=${discovery_addresses}
+# NOM Configuration
+server.metrics.prometheus.endpoint=127.0.0.1:2004
+server.metrics.prometheus.enabled=true
+server.metrics.enabled=true
+server.metrics.filter=*
+server.metrics.jmx.enabled=true
+
+EOT
+
+$db_home/bin/neo4j-admin server license --accept-commercial
+$db_home/bin/neo4j-admin dbms set-initial-password neo4jneo4j
+$db_home/bin/neo4j start
+
+sleep 20
+
+# Genrerate server.pem file for the agents
+openssl pkcs12 -passin pass:'changeit' -nodes -in $nom_agent_home/certificates/server.pfx -out $nom_agent_home/certificates/server.pem
+
+# Generate agent self signed certificate
+$nom_agent_home/bin/agent ssc -n nom-agent-${index_count} -o $nom_agent_home/certificates
+chmod 644 $nom_server_home/certificates/nom-agents.cert.pem
+
+# Upload certs to s3 bucket
+aws s3 cp $nom_agent_home/certificates/nom-agent-${index_count}.cert.pem s3://terraform-neo4j-nom-s3/ 
+
+# Wait for Nom server to download the certs from S3 and start its service
+sleep 20
+
+# Setup NOM to run as service
+/usr/local/bin/nom/bin/agent service -s install
+semanage fcontext -a -t bin_t $nom_agent_home/bin/agent
+restorecon -v $nom_agent_home/bin/agent
+rm -f /etc/systemd/system/neo4j-ops-manager-agent.service
+chown -R root:root /usr/local/bin/nom-server
+
+tee -a /etc/systemd/system/neo4j-ops-manager-agent.service >/dev/null <<EOT
+[Unit]
+Description=Agent for Neo4j Operations Manager
+ConditionFileIsExecutable=$nom_agent_home/bin/agent
+
+# For Self-Registering Agent 
+[Service]
+StartLimitInterval=5
+StartLimitBurst=10
+ExecStart=/usr/local/bin/nom/bin/agent "service" "-s"
+Environment="CONFIG_SERVER_GRPC_ADDRESS=${nom_server_dns}:9090"
+Environment="CONFIG_SERVER_HTTP_ADDRESS=https://${nom_server_dns}:8080"
+Environment="CONFIG_LOG_FILE=$nom_agent_home/logs/log.txt"
+Environment="CONFIG_INSTANCE_1_NAME=node-${index_count}"
+Environment="CONFIG_INSTANCE_1_BOLT_URI=bolt://localhost:7687"
+Environment="CONFIG_INSTANCE_1_BOLT_USERNAME=neo4j"
+Environment="CONFIG_INSTANCE_1_BOLT_PASSWORD=neo4jneo4j"
+Environment="CONFIG_INSTANCE_1_QUERY_LOG_PORT=9500"
+Environment="CONFIG_INSTANCE_1_LOG_CONFIG_PATH=$db_home/conf/server-logs.xml"
+Environment="CONFIG_TLS_TRUSTED_CERTS=$nom_agent_home/certificates/server.pem"
+Environment="CONFIG_AGENT_CONFIG_PATH=$nom_agent_home"
+Environment="CONFIG_TLS_CLIENT_CERT=/usr/local/bin/nom/certificates/nom-agent-${index_count}.cert.pem" 
+Environment="CONFIG_TLS_CLIENT_KEY=/usr/local/bin/nom/certificates/nom-agent-${index_count}.key.pem"
+Environment="CONFIG_AGENT_NAME=nom-agent-${index_count}"
+
+# Change the following for manual registration
+## Uncomment and replace the configuration ##
+; [Service]
+; StartLimitInterval=5
+; StartLimitBurst=10
+; ExecStart=$nom_agent_home/bin/agent "service" 
+
+; Environment="CONFIG_TOKEN_CLIENT_ID=changeme"
+; Environment="CONFIG_TOKEN_CLIENT_SECRET=changeme"
+
+; Environment="CONFIG_SERVER_ADDRESS=${nom_server_dns}:9090"
+; Environment="CONFIG_TOKEN_URL=https://${nom_server_dns}:8080/api/login/agent"
+; Environment="CONFIG_LOG_FILE=$nom_agent_home/logs/log.txt"
+; Environment="CONFIG_INSTANCE_${index_count}_NAME=neo4j-cluster-node-${index_count}"
+; Environment="CONFIG_INSTANCE_${index_count}_BOLT_URI=bolt://localhost:7687"
+; Environment="CONFIG_INSTANCE_${index_count}_BOLT_USERNAME=neo4j"
+; Environment="CONFIG_INSTANCE_${index_count}_BOLT_PASSWORD=neo4jneo4j"
+; Environment="CONFIG_INSTANCE_${index_count}_QUERY_LOG_PORT=9500"
+; Environment="CONFIG_INSTANCE_${index_count}_LOG_CONFIG_PATH=$db_home/conf/server-logs.xml"
+; Environment="CONFIG_AGENT_CONFIG_PATH=$nom_agent_home"
+
+Restart=always
+
+RestartSec=120
+EnvironmentFile=-/etc/sysconfig/neo4j-ops-manager-agent
+
+[Install]
+WantedBy=multi-user.target
+
+EOT
+
+# Uncomment the below if enabling self-registration of agents
+systemctl daemon-reload
+systemctl enable neo4j-ops-manager-agent
+systemctl start neo4j-ops-manager-agent
+
+
+rm -rf installation-staging
+rm -rf neo4j-enterprise-${neo4j_version}
+
