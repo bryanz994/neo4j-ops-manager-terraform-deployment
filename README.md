@@ -1,4 +1,4 @@
-# Neo4j Deployment using Terraform (GCP)
+# Neo4j Deployment using Terraform (AWS)
 
 This repo provides [Terraform](https://www.terraform.io/) templates to support deployment of Neo4j Graph Data Platform and Neo4j Ops Manager (NOM) in Amazon Web Services (AWS).
 
