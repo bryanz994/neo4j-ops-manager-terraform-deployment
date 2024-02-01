@@ -30,7 +30,7 @@ A working Terraform setup in your local machine or host which is going to be use
 
 1. Setup Terraform
 2. Clone this repo
-3. The following policies are required for the IAM user:
+3. The following AWS policies are required to run the Terraform script successfully:
    1. AmazonEC2FullAccess
    2. AmazonVPCFullAccess
    3. AmazonS3FullAccess
