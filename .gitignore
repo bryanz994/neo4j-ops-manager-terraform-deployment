@@ -1,6 +1,13 @@
 # Local .terraform directories
 **/.terraform/*
 
+# Any assets added
+**/assets/*.zip
+**/assets/*.gz
+
+# terraform lock file
+.terraform.lock.hcl
+
 # .tfstate files
 *.tfstate
 *.tfstate.*
